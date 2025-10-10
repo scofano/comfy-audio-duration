@@ -1,3 +1,6 @@
+![Audio Duration Screenshot](https://github.com/scofano/comfy-audio-duration/raw/main/screenshot.png)
+
+
 # Audio Duration (ComfyUI Custom Node)
 
 Returns the duration of an audio source, which can be provided either as a filesystem path or as raw audio data (samples and sample rate) from an upstream node. Duration calculation primarily uses `ffprobe` (from FFmpeg) for paths, or calculates the duration directly from samples/SR if no path is available.
