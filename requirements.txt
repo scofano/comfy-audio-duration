@@ -1,0 +1,5 @@
+scipy
+numpy
+# Optional: Include torch if you handle PyTorch tensors a lot and want to ensure it's available,
+# though it's usually already present in ComfyUI environments.
+# torch
