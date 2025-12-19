@@ -4,7 +4,7 @@ import shutil
 import subprocess
 from typing import Any, Optional, Tuple
 import tempfile
-import numpy as np  # Added for data manipulation
+import numpy as np
 
 # ComfyUI temp directory helper
 try:
@@ -13,12 +13,9 @@ except ImportError:
     folder_paths = None
 
 # NOTE: scipy is not included in all ComfyUI installations by default.
-# Users must ensure they have 'scipy' installed (e.g., pip install scipy).
 try:
-    from scipy.io.wavfile import write as write_wav  # Added for saving audio
+    from scipy.io.wavfile import write as write_wav
 except ImportError:
-    # Fallback to allow the rest of the node to load even if scipy is missing
-    # (The saving functionality will fail, but other path/duration checks might pass)
     def write_wav(*args, **kwargs):
         raise ImportError(
             "scipy not found. Please install it (e.g., pip install scipy) "
@@ -29,21 +26,21 @@ except ImportError:
 class AudioDurationNode:
     """
     ComfyUI custom node that returns the duration of an audio file.
-    It can consume EITHER:
-      • audio_path (STRING)  — a filesystem path to an audio file, OR
-      • audio (AUDIO)        — an upstream audio object from another node.
-
-    Outputs (in order):
+    
+    Inputs:
+      • audio_path (STRING) — filesystem path to an audio file, OR
+      • audio (AUDIO)       — upstream audio object from another node
+    
+    Outputs:
       1) seconds_int (INT)
       2) seconds_float (FLOAT)
       3) minutes_int (INT)
       4) minutes_float (FLOAT)
-      5) temp_wav_path (STRING) — full path to the temp WAV file ("" if not created)
+      5) temp_wav_path (STRING) — full path to temp WAV file (if created)
     """
 
     @classmethod
     def INPUT_TYPES(cls):
-        # audio_path may be left empty; if so and AUDIO is connected, we use the audio input
         return {
             "required": {
                 "audio_path": ("STRING", {"multiline": False, "default": ""}),
@@ -64,178 +61,182 @@ class AudioDurationNode:
     FUNCTION = "run"
     CATEGORY = "audio/utils"
 
-    # ------------------------- helpers -------------------------
+    # ==================== Helper Methods ====================
 
-    def _extract_samples_sr(self, audio_obj):
-        """Return (samples, sr) or (None, None) from many possible AUDIO shapes, including
-        nested dicts and batched lists."""
-        # 0) None
+    def _to_numpy(self, data):
+        """Convert torch tensor or other array-like to numpy array."""
+        if data is None:
+            return None
+        
+        # Handle torch tensors
+        if hasattr(data, "detach") and hasattr(data, "cpu"):
+            return data.detach().cpu().numpy()
+        
+        # Handle numpy arrays
+        if hasattr(data, "numpy"):
+            return data.numpy()
+        
+        # Already numpy or convert
+        return np.asarray(data)
+
+    def _extract_audio_info(self, audio_obj):
+        """
+        Extract (samples, sample_rate, channels) from various AUDIO formats.
+        
+        Returns:
+            Tuple[Optional[np.ndarray], Optional[float], Optional[int]]
+        """
         if audio_obj is None:
-            return None, None
+            return None, None, None
 
-        # 1) If it's a batch/list, try first non-empty item
-        if isinstance(audio_obj, (list, tuple)):
-            # handle tuple like (samples, sr)
-            if len(audio_obj) == 2 and not isinstance(
-                audio_obj[0], (list, tuple, dict)
-            ):
-                samples, sr = audio_obj
-                try:
-                    sr = float(sr.item()) if hasattr(sr, "item") else float(sr)
-                except Exception:
-                    pass
-                return samples, sr
-            # otherwise iterate for first extractable item
-            for item in audio_obj:
-                s, r = self._extract_samples_sr(item)
-                if s is not None and r is not None:
-                    return s, r
-            return None, None
+        samples = None
+        sr = None
+        channels = None
 
-        # 2) Dict-like
+        # Handle dict-like objects (most common in ComfyUI)
         if isinstance(audio_obj, dict):
-            # direct pairs at top-level
-            for x_name in ("samples", "waveform", "audio", "pcm", "array", "data"):
-                for sr_name in ("sample_rate", "sr"):
-                    x = audio_obj.get(x_name)
-                    r = audio_obj.get(sr_name)
-                    # if 'audio' is a nested dict, recurse
-                    if x_name == "audio" and isinstance(x, dict) and r is None:
-                        return self._extract_samples_sr(x)
-                    if x is not None and r is not None:
-                        return x, r
+            # Try to get samples/waveform
+            for key in ("waveform", "samples", "audio", "pcm", "data", "tensor"):
+                if key in audio_obj:
+                    samples = self._to_numpy(audio_obj[key])
+                    break
+            
+            # Try to get sample rate
+            for key in ("sample_rate", "sr"):
+                if key in audio_obj:
+                    sr = audio_obj[key]
+                    break
+            
+            # Try to get channels
+            for key in ("channels", "num_channels", "n_channels"):
+                if key in audio_obj:
+                    channels = audio_obj[key]
+                    break
 
-            # some generators return {"tensor": ..., "sample_rate": ...}
-            x = audio_obj.get("tensor")
-            r = audio_obj.get("sample_rate", audio_obj.get("sr"))
-            if x is not None and r is not None:
-                return x, r
+        # Handle list/tuple (e.g., (samples, sr))
+        elif isinstance(audio_obj, (list, tuple)):
+            if len(audio_obj) >= 2:
+                samples = self._to_numpy(audio_obj[0])
+                sr = audio_obj[1]
+                if len(audio_obj) >= 3:
+                    channels = audio_obj[2]
 
-            # last chance: look for a nested dict that contains samples+sr
-            for v in audio_obj.values():
-                if isinstance(v, dict):
-                    s, r = self._extract_samples_sr(v)
-                    if s is not None and r is not None:
-                        return s, r
-            return None, None
+        # Handle object with attributes
+        else:
+            for attr in ("waveform", "samples", "audio", "data"):
+                if hasattr(audio_obj, attr):
+                    samples = self._to_numpy(getattr(audio_obj, attr))
+                    break
+            
+            for attr in ("sample_rate", "sr"):
+                if hasattr(audio_obj, attr):
+                    sr = getattr(audio_obj, attr)
+                    break
+            
+            for attr in ("channels", "num_channels", "n_channels"):
+                if hasattr(audio_obj, attr):
+                    channels = getattr(audio_obj, attr)
+                    break
 
-        # 3) Object attributes
-        for sr_name in ("sample_rate", "sr"):
-            for x_name in ("samples", "waveform", "audio", "pcm", "data"):
-                try:
-                    x = getattr(audio_obj, x_name)
-                    r = getattr(audio_obj, sr_name)
-                    if x is not None and r is not None:
-                        return x, r
-                except Exception:
-                    pass
-
-        return None, None
-
-    def _probe_seconds_ffprobe(self, path: str) -> float:
-        if shutil.which("ffprobe") is None:
-            raise RuntimeError(
-                "ffprobe not found on PATH. Please install FFmpeg and ensure ffprobe is available."
-            )
-        cmd = [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            path,
-        ]
-        try:
-            out = subprocess.check_output(cmd, text=True).strip()
-            secs = float(out)
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"ffprobe failed: {e}")
-        except ValueError:
-            raise RuntimeError(
-                f"ffprobe returned a non-numeric duration for {path!r}: {out!r}"
-            )
-        if secs < 0:
-            raise RuntimeError(f"Invalid (negative) duration returned: {secs}")
-        return secs
-
-    def _duration_from_samples(self, audio_obj: Any) -> Optional[float]:
-        # Short-circuit if a numeric duration is provided
-        if isinstance(audio_obj, dict):
-            d = audio_obj.get("duration")
-            if isinstance(d, (int, float)) and d > 0:
-                return float(d)
-
-        samples, sr = self._extract_samples_sr(audio_obj)
-        if samples is None or not sr:
-            return None
-
-        # sr might be a tensor/np scalar
-        try:
+        # Convert sr to float
+        if sr is not None:
             sr = float(sr.item()) if hasattr(sr, "item") else float(sr)
-        except Exception:
-            sr = float(sr)
 
-        # Resolve number of frames for common containers (list/tuple/np/torch)
-        try:
-            import numpy as _np  # optional
-        except Exception:
-            _np = None
+        # Convert channels to int
+        if channels is not None:
+            channels = int(channels.item()) if hasattr(channels, "item") else int(channels)
 
-        try:
-            import torch as _torch  # optional
-        except Exception:
-            _torch = None
+        return samples, sr, channels
 
-        n_frames = None
-        try:
-            if _torch is not None and isinstance(samples, _torch.Tensor):
-                samples = samples.detach().cpu().numpy()  # Convert to numpy
-                _np = np
-
-            if _np is not None and isinstance(samples, _np.ndarray):
-                # Ensure it's a 2D array [N_frames, N_channels] or [N_frames]
-                if samples.ndim == 1:
-                    n_frames = samples.shape[0]
-                elif samples.ndim == 2:
-                    # Assume the longer dimension is the number of frames
-                    n_frames = max(samples.shape)
-            else:
-                # Python sequence fallback
-                if (
-                    hasattr(samples, "__getitem__")
-                    and len(samples) > 0
-                    and hasattr(samples[0], "__len__")
-                ):
-                    n_frames = max(len(ch) for ch in samples)
-                else:
-                    n_frames = len(samples)
-        except Exception:
-            try:
-                n_frames = len(samples)
-            except Exception:
-                return None
-
-        if not n_frames or sr <= 0:
+    def _infer_channels_from_shape(self, samples):
+        """
+        Infer number of channels from array shape.
+        
+        Returns:
+            int or None
+        """
+        if samples is None or not isinstance(samples, np.ndarray):
             return None
+        
+        if samples.ndim == 1:
+            # Cannot reliably infer from 1D array
+            return None
+        elif samples.ndim == 2:
+            # Smaller dimension is likely channels
+            # Common formats: [channels, frames] or [frames, channels]
+            return min(samples.shape)
+        else:
+            # Higher dimensions - take the smallest
+            return min(samples.shape)
+
+    def _calculate_duration_from_samples(self, samples, sr, channels):
+        """
+        Calculate duration in seconds from audio samples.
+        
+        Args:
+            samples: numpy array of audio data
+            sr: sample rate (Hz)
+            channels: number of channels (or None)
+        
+        Returns:
+            float: duration in seconds, or None if cannot calculate
+        """
+        if samples is None or sr is None or sr <= 0:
+            return None
+
+        samples = self._to_numpy(samples)
+        if samples is None:
+            return None
+
+        # Infer channels from shape if not provided
+        if channels is None:
+            channels = self._infer_channels_from_shape(samples)
+
+        # Calculate number of frames based on array shape
+        if samples.ndim == 1:
+            # 1D array: could be mono OR interleaved stereo/multi-channel
+            total_samples = len(samples)
+            if channels is not None and channels > 1:
+                # Interleaved format: [L1, R1, L2, R2, ...]
+                n_frames = total_samples // channels
+            else:
+                # Assume mono if channels unknown
+                n_frames = total_samples
+                if channels is None:
+                    print(
+                        f"Warning: 1D audio array without channel info. "
+                        f"Assuming mono ({total_samples} samples). "
+                        f"If this is stereo, duration will be 2x actual."
+                    )
+        
+        elif samples.ndim == 2:
+            # 2D array: [channels, frames] or [frames, channels]
+            # The larger dimension is more likely frames
+            if samples.shape[0] > samples.shape[1]:
+                n_frames = samples.shape[0]  # [frames, channels]
+            else:
+                n_frames = samples.shape[1]  # [channels, frames]
+        
+        else:
+            # 3D+ arrays: flatten or take max dimension
+            n_frames = max(samples.shape)
+
+        if n_frames <= 0:
+            return None
+
         return float(n_frames) / float(sr)
 
-    def _path_from_audio_obj(self, audio_obj: Any) -> Optional[str]:
-        # Straight string path
+    def _extract_file_path(self, audio_obj):
+        """Extract file path from audio object if available."""
         if isinstance(audio_obj, str) and os.path.isfile(audio_obj):
             return audio_obj
 
-        # Dict-like with common keys
         if isinstance(audio_obj, dict):
             for key in ("path", "filepath", "file", "audio_path"):
                 p = audio_obj.get(key)
                 if isinstance(p, str) and os.path.isfile(p):
                     return p
-            # Some nodes provide a precomputed duration; handled in _duration_from_samples
-            # (no path to return here)
 
-        # Objects with attributes
         for attr in ("path", "filepath", "file", "audio_path"):
             try:
                 p = getattr(audio_obj, attr)
@@ -246,46 +247,78 @@ class AudioDurationNode:
 
         return None
 
-    # ------------------------- NEW HELPER FUNCTION -------------------------
+    def _probe_duration_ffprobe(self, path: str) -> float:
+        """Use ffprobe to get duration of audio file."""
+        if shutil.which("ffprobe") is None:
+            raise RuntimeError(
+                "ffprobe not found. Please install FFmpeg."
+            )
+        
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path,
+        ]
+        
+        try:
+            out = subprocess.check_output(cmd, text=True).strip()
+            duration = float(out)
+        except (subprocess.CalledProcessError, ValueError) as e:
+            raise RuntimeError(f"ffprobe failed for {path}: {e}")
+        
+        if duration < 0:
+            raise RuntimeError(f"Invalid duration: {duration}")
+        
+        return duration
 
-    def _save_audio_to_temp(self, samples: Any, sr: float) -> Optional[str]:
+    def _save_temp_wav(self, samples, sr, channels=None):
         """
-        Saves samples/sr to a temporary WAV file in the ComfyUI temp folder.
-
+        Save audio samples to a temporary WAV file.
+        
         Returns:
-            Full path to the temp WAV file, or None on failure.
+            str: path to temp file, or None on failure
         """
         try:
             if sr <= 0:
                 return None
 
-            # Convert to numpy array if it's not already
-            if hasattr(samples, "detach") and hasattr(samples, "cpu") and hasattr(
-                samples, "numpy"
-            ):
-                samples = samples.detach().cpu().numpy()
-            elif hasattr(samples, "numpy"):
-                samples = samples.numpy()
-            samples = np.asarray(samples)
+            samples = self._to_numpy(samples)
+            if samples is None:
+                return None
 
-            # Convert shape: from [Channels, Frames] or [Frames] to [Frames, Channels]
-            if samples.ndim == 2 and samples.shape[0] < samples.shape[1]:
-                # Assuming [C, N] is common in torch/some loaders, convert to [N, C]
-                samples = samples.T
-            elif samples.ndim > 2:
-                # Reduce to 2D by flattening extra dimensions or taking the first batch item
-                if samples.shape[-1] < 10:
-                    samples = samples.reshape(-1, samples.shape[-1])
+            # Infer channels if not provided
+            if channels is None:
+                channels = self._infer_channels_from_shape(samples)
+
+            # Reshape to [frames, channels] for WAV writing
+            if samples.ndim == 1:
+                if channels is not None and channels > 1:
+                    # Reshape interleaved to [frames, channels]
+                    n_frames = len(samples) // channels
+                    samples = samples[:n_frames * channels].reshape(n_frames, channels)
                 else:
-                    samples = samples.flatten()
+                    # Keep as 1D for mono
+                    samples = samples.reshape(-1, 1)
+            
+            elif samples.ndim == 2:
+                # Ensure [frames, channels] format
+                if samples.shape[0] < samples.shape[1]:
+                    # Likely [channels, frames], transpose
+                    samples = samples.T
 
-            # Normalize data type and range for WAV saving (e.g., int16)
-            max_val = np.abs(samples).max()
-            if max_val <= 1.0:
-                # Normalize float samples to int16 range if they are floats
-                samples = (samples * 32767).astype(np.int16)
+            # Normalize to int16 range if needed
+            if samples.dtype.kind == 'f':  # float type
+                max_val = np.abs(samples).max()
+                if max_val > 0:
+                    samples = (samples / max_val * 32767).astype(np.int16)
+                else:
+                    samples = samples.astype(np.int16)
+            elif samples.dtype != np.int16:
+                samples = samples.astype(np.int16)
 
-            # Use ComfyUI's temp directory structure if available
+            # Determine temp directory
             if folder_paths is not None:
                 try:
                     base_temp = folder_paths.get_temp_directory()
@@ -298,82 +331,86 @@ class AudioDurationNode:
             os.makedirs(output_dir, exist_ok=True)
 
             temp_path = os.path.join(
-                output_dir, f"temp_{os.getpid()}_{os.urandom(4).hex()}.wav"
+                output_dir,
+                f"temp_{os.getpid()}_{os.urandom(4).hex()}.wav"
             )
 
             write_wav(temp_path, int(sr), samples)
-
             return temp_path
 
         except Exception as e:
-            print(f"Error saving audio to temporary file for duration check: {e}")
+            print(f"Error saving temp WAV: {e}")
             return None
 
-    # ------------------------- main -------------------------
+    # ==================== Main Function ====================
 
-    def run(self, audio_path: str, audio: Any = None) -> Tuple[int, float, int, float, str]:
-        # Priority: explicit audio_path if provided, otherwise try AUDIO input
-        seconds: Optional[float] = None
-        path_to_probe: Optional[str] = None
-        temp_wav_path: str = ""
+    def run(
+        self,
+        audio_path: str,
+        audio: Any = None
+    ) -> Tuple[int, float, int, float, str]:
+        """
+        Main execution function.
+        
+        Returns:
+            (seconds_int, seconds_float, minutes_int, minutes_float, temp_wav_path)
+        """
+        duration = None
+        file_path = None
+        temp_wav_path = ""
 
-        # Case 1: explicit path string
+        # Priority 1: Explicit audio_path string
         if isinstance(audio_path, str) and audio_path.strip():
-            if os.path.isfile(audio_path.strip()):
-                path_to_probe = audio_path.strip()
+            path = audio_path.strip()
+            if os.path.isfile(path):
+                file_path = path
 
-        # Case 2: AUDIO input
-        if not path_to_probe and audio is not None:
-            # a) Try extracting a path first
-            path_to_probe = self._path_from_audio_obj(audio)
+        # Priority 2: AUDIO object
+        if audio is not None:
+            # Try to extract existing file path
+            if file_path is None:
+                file_path = self._extract_file_path(audio)
 
-            # b) If we can extract samples/sr, save a temp WAV in ComfyUI temp dir
-            samples, sr = self._extract_samples_sr(audio)
+            # Try to calculate from samples
+            samples, sr, channels = self._extract_audio_info(audio)
+            
             if samples is not None and sr is not None:
-                temp = self._save_audio_to_temp(samples, sr)
+                # Calculate duration directly
+                duration = self._calculate_duration_from_samples(samples, sr, channels)
+                
+                # Also save a temp WAV for reference/debugging
+                temp = self._save_temp_wav(samples, sr, channels)
                 if temp:
                     temp_wav_path = temp
-                    # If we didn't find another path, use this temp file for probing
-                    if path_to_probe is None:
-                        path_to_probe = temp
+                    # Use temp file for probing if we don't have another path
+                    if file_path is None:
+                        file_path = temp
 
-            # c) If no path yet, try duration from samples/dict metadata
-            if path_to_probe is None:
-                seconds = self._duration_from_samples(audio)
-
-        # If we still don't have seconds, probe by path (original or temp)
-        if seconds is None:
-            if not path_to_probe:
+        # Fallback: probe file with ffprobe if we haven't calculated duration yet
+        if duration is None:
+            if file_path is None:
                 raise RuntimeError(
-                    "Provide either a valid audio_path or connect an AUDIO input "
-                    "that contains a usable path/samples."
+                    "No valid audio source provided. "
+                    "Please provide either audio_path or connect an AUDIO input."
                 )
-            # Use ffprobe on the file path (either original or temp)
-            seconds = self._probe_seconds_ffprobe(path_to_probe)
+            duration = self._probe_duration_ffprobe(file_path)
 
-        # Ensure seconds is valid
-        if seconds is None or seconds <= 0:
-            raise RuntimeError(
-                f"Could not determine a valid duration for the audio source: "
-                f"{path_to_probe or 'AUDIO input'}"
-            )
+        # Validate
+        if duration is None or duration <= 0:
+            raise RuntimeError(f"Invalid duration calculated: {duration}")
 
-        # If no temp WAV was created (e.g., only audio_path was used or no samples),
-        # keep the output as an empty string to avoid misleading paths.
-        if temp_wav_path is None:
-            temp_wav_path = ""
-
-        # Package outputs
+        # Return outputs
         return (
-            int(seconds),
-            float(seconds),
-            int(seconds // 60),
-            float(seconds) / 60.0,
-            temp_wav_path,
+            int(duration),                  # seconds_int
+            float(duration),                # seconds_float
+            int(duration // 60),            # minutes_int
+            float(duration / 60.0),         # minutes_float
+            temp_wav_path,                  # temp_wav_path
         )
 
 
-# Expose node(s) to ComfyUI
+# ==================== ComfyUI Registration ====================
+
 NODE_CLASS_MAPPINGS = {
     "Audio Duration": AudioDurationNode,
 }
